@@ -17,8 +17,8 @@
 
 {{ dbt_utils.union_relations(
     relations=[
-        ref('table_refer_to_raw_semantic_view'),
-        ref('table_refer_to_semantic_view')
+        source('seed_sources', 'raw_semantic_view'),
+        ref('semantic_view_basic')
     ]
 ) }}
 
