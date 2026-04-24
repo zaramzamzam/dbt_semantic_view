@@ -613,6 +613,14 @@
   `name` is a final fallback for edge cases. Sources have no `.alias`
   and populate `.identifier`.
 
+  Tiered lookup:
+    Tier 1: strict (database, schema, identifier) match against graph.nodes.
+    Tier 2: strict (database, schema, identifier) match against graph.sources (if Tier 1 found nothing).
+    Tier 3: identifier-only match against graph.nodes (if Tier 2 found nothing). This handles cross-env
+            sv_ref references where the resolved table lives in a different database than the one recorded in graph.nodes.
+            Sources are excluded from this tier because source identifiers are not unique within a project (the same table name can appear
+            across multiple schemas), whereas model names are unique by convention.
+
   Returns the raw description string (may be empty). Caller decides
   whether to emit a COMMENT clause.
 -#}
@@ -643,6 +651,22 @@
             and (src.schema or '') | lower == target_schema
             and (physical | lower) == target_identifier -%}
           {%- set found.node = src -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+
+  {#- Tier 3: identifier-only fallback on graph.nodes for cross-env sv_ref scenarios where the
+      resolved table lives in a
+      different database than the one recorded in graph.nodes.
+      Sources are intentionally excluded: source identifiers are not unique within a project and
+      an identifier-only match against graph.sources risks returning the wrong node. -#}
+  {%- if found.node is none -%}
+    {%- for node in graph.nodes.values() -%}
+      {%- if found.node is none -%}
+        {%- set physical = node.alias or node.identifier or node.name -%}
+        {%- if physical and (physical | lower) == target_identifier -%}
+          {%- set found.node = node -%}
         {%- endif -%}
       {%- endif -%}
     {%- endfor -%}
