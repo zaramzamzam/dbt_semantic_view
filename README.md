@@ -105,20 +105,29 @@ Using a source table:
 TABLES(t1 AS {{ dbt_semantic_view.sv_source('my_source', 'my_table') }})
 ```
 
-### Note on documentation persistence (persist_docs)
-At this time, dbt-driven documentation persistence for Semantic Views (persist_docs) is not supported by this package. Enabling `persist_docs` and adding model or column descriptions will not affect Semantic Views.
+### Documentation persistence (persist_docs)
+This package supports both relation-level and column-level `persist_docs` for Semantic Views.
 
-Inline COMMENT syntax within the Semantic View DDL is supported and will be applied by Snowflake. For example:
-```
-CREATE OR REPLACE SEMANTIC VIEW <name>
-  TABLES ( ... COMMENT = '...' )
-  [ FACTS ( ... COMMENT = '...' ) ]
-  [ DIMENSIONS ( ... COMMENT = '...' ) ]
-  [ METRICS ( ... COMMENT = '...' ) ]
-  [ COMMENT = '...' ]
+**Relation-level** — enable `persist_docs: {relation: true}` and add a model `description:` in `schema.yml`. The description is emitted as a top-level `COMMENT = $$...$$` on the `CREATE OR REPLACE SEMANTIC VIEW` statement. If your model already writes an inline top-level `COMMENT = ...`, it is preserved unchanged (**inline SQL wins**).
+
+**Column-level (dimensions / metrics / facts)** — Snowflake requires dim/metric/fact `COMMENT` clauses to be emitted inline at create time (they cannot be added via `ALTER SEMANTIC VIEW`). Enable `persist_docs: {columns: true}`. Write your semantic view using the standard Snowflake syntax. At materialize time the package scans each `DIMENSIONS`/`METRICS`/`FACTS` entry and, when the RHS of `AS` is a simple column reference (optionally alias-qualified, e.g., `value` or `t1.value`) and the LHS is alias-qualified, looks up the underlying `schema.yml` / `source.yml` column description and appends `COMMENT = $$…$$` to that entry. Entries that already contain an inline `COMMENT = …` are left untouched (inline wins). Column lookups always resolve against the table behind the **LHS alias**, so cross-alias RHS references like `t1.my_dim AS t2.col` will pull the description for `col` from `t1`'s underlying table, not `t2`'s — if the two tables don't share that column, no comment is emitted.
+
+Example — mirrors `integration_tests/models/semantic_view_with_persist_docs.sql`:
+
+```sql
+{{ config(materialized='semantic_view') }}
+
+TABLES(t1 AS {{ dbt_semantic_view.sv_ref('base_table') }}, t2 AS {{ dbt_semantic_view.sv_source('seed_sources', 'base_table2') }})
+DIMENSIONS(
+  t1.count AS value,
+  t2.volume AS value
+)
+METRICS(
+  t1.total_rows AS SUM(t1.count) COMMENT = $$Total row count aggregate$$
+)
 ```
 
-We plan to revisit persist_docs support as upstream capabilities evolve.
+With a model `description:` in `schema.yml` and project-wide `persist_docs: {relation: true, columns: true}`, this renders a single `CREATE OR REPLACE SEMANTIC VIEW` with a top-level `COMMENT`, plus per-dim `COMMENT = $$Generic numeric value column$$` resolved from the underlying `base_table.value` / `base_table2.value` descriptions. The metric's inline `COMMENT = $$Total row count aggregate$$` is preserved as-is — inline always wins.
 
 ### Development
 - Python 3.9+ recommended
