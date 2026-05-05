@@ -14,7 +14,12 @@
   passthrough — there is no single column to look up.
 
   Limitations:
-  - SQL comments inside body (-- or /* */) are not handled as opaque regions.
+  - SQL comments inside the semantic view body (-- or /* */) are not handled as
+    opaque regions. A single quote inside a SQL comment (e.g., -- it's a note)
+    will be treated as the start of a string literal, potentially causing
+    _sv_find_clause to skip over the actual clause. Column comments for the
+    affected clause will be silently skipped. Workaround: avoid -- and /* */
+    comments inside semantic view model SQL bodies.
   - RELATIONSHIPS entries are not processed.
   - Model-local columns: in the semantic view's own schema.yml are not used as
     an override source.
@@ -167,7 +172,9 @@
                 {%- endif -%}
               {%- endif -%}
             {%- endfor -%}
-            {%- set ns.skip_until = sql | length -%}
+            {%- if ns.found -%}
+              {%- set ns.skip_until = sql | length -%}
+            {%- endif -%}
           {%- endif -%}
         {%- endif -%}
 
