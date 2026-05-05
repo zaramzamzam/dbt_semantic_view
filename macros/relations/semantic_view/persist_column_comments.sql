@@ -14,7 +14,12 @@
   passthrough — there is no single column to look up.
 
   Limitations:
-  - SQL comments inside body (-- or /* */) are not handled as opaque regions.
+  - SQL comments inside the semantic view body (-- or /* */) are not handled as
+    opaque regions. A single quote inside a SQL comment (e.g., -- it's a note)
+    will be treated as the start of a string literal, potentially causing
+    _sv_find_clause to skip over the actual clause. Column comments for the
+    affected clause will be silently skipped. Workaround: avoid -- and /* */
+    comments inside semantic view model SQL bodies.
   - RELATIONSHIPS entries are not processed.
   - Model-local columns: in the semantic view's own schema.yml are not used as
     an override source.
@@ -102,147 +107,77 @@
   word-boundary checks on both sides. After the keyword match, skips
   whitespace and expects an opening `(`, then walks to the matching `)`.
 
+  Uses direct string iteration (for ch in sql) instead of range(n) to
+  avoid Jinja's MAX_RANGE sandbox limit on large compiled SQL bodies.
+  String literal boundaries are found via regex rather than nested loops.
+
   Returns a dict: {found, open_idx, close_idx}
     - found: bool
     - open_idx: index of the `(` after keyword (or -1)
     - close_idx: index of the matching `)` (or -1)
 -#}
 {% macro _sv_find_clause(sql, keyword) -%}
-  {%- set n = sql | length -%}
   {%- set kw_lower = keyword | lower -%}
   {%- set kw_len = keyword | length -%}
   {%- set lower_sql = sql | lower -%}
-  {%- set ns = namespace(i=0, depth=0, found=false, open_idx=-1, close_idx=-1) -%}
+  {%- set ns = namespace(depth=0, found=false, open_idx=-1, close_idx=-1, skip_until=0) -%}
 
-  {%- for _ in range(n) -%}
-    {%- if ns.i < n and not ns.found -%}
-      {%- set ch = sql[ns.i] -%}
+  {%- for ch in sql -%}
+    {%- set i = loop.index0 -%}
+    {%- if i >= ns.skip_until and not ns.found -%}
 
-      {#- Single-quoted string: skip contents, '' is an escaped quote -#}
       {%- if ch == "'" -%}
-        {%- set ns.i = ns.i + 1 -%}
-        {%- set inner = namespace(done=false) -%}
-        {%- for _ in range(n - ns.i) -%}
-          {%- if not inner.done and ns.i < n -%}
-            {%- if sql[ns.i] == "'" -%}
-              {%- if sql[ns.i + 1:ns.i + 2] == "'" -%}
-                {%- set ns.i = ns.i + 2 -%}
-              {%- else -%}
-                {%- set ns.i = ns.i + 1 -%}
-                {%- set inner.done = true -%}
-              {%- endif -%}
-            {%- else -%}
-              {%- set ns.i = ns.i + 1 -%}
-            {%- endif -%}
-          {%- endif -%}
-        {%- endfor -%}
+        {%- set end_q = modules.re.search("(?:[^']|'')*'", sql[i + 1:]) -%}
+        {%- set ns.skip_until = (i + 1 + end_q.end()) if end_q else (sql | length) -%}
 
-      {#- Dollar-quoted string: skip contents -#}
-      {%- elif ch == '$' and sql[ns.i + 1:ns.i + 2] == '$' -%}
-        {%- set ns.i = ns.i + 2 -%}
-        {%- set inner = namespace(done=false) -%}
-        {%- for _ in range(n - ns.i) -%}
-          {%- if not inner.done and ns.i < n -%}
-            {%- if sql[ns.i] == '$' and sql[ns.i + 1:ns.i + 2] == '$' -%}
-              {%- set ns.i = ns.i + 2 -%}
-              {%- set inner.done = true -%}
-            {%- else -%}
-              {%- set ns.i = ns.i + 1 -%}
-            {%- endif -%}
-          {%- endif -%}
-        {%- endfor -%}
+      {%- elif ch == '$' and sql[i + 1:i + 2] == '$' -%}
+        {%- set end_dq = sql.find('$$', i + 2) -%}
+        {%- set ns.skip_until = (end_dq + 2) if end_dq != -1 else (sql | length) -%}
 
       {%- elif ch == '(' -%}
         {%- set ns.depth = ns.depth + 1 -%}
-        {%- set ns.i = ns.i + 1 -%}
 
       {%- elif ch == ')' -%}
         {%- set ns.depth = ns.depth - 1 -%}
-        {%- set ns.i = ns.i + 1 -%}
 
-      {#- At depth 0, check for keyword with word-boundary guards -#}
-      {%- elif ns.depth == 0 and lower_sql[ns.i:ns.i + kw_len] == kw_lower -%}
-        {%- set prev_char = sql[ns.i - 1:ns.i] -%}
+      {%- elif ns.depth == 0 and lower_sql[i:i + kw_len] == kw_lower -%}
+        {%- set prev_char = sql[i - 1:i] -%}
         {%- set prev_ok = prev_char == '' or not (prev_char.isalnum() or prev_char == '_') -%}
-        {%- set after_pos = ns.i + kw_len -%}
+        {%- set after_pos = i + kw_len -%}
         {%- set next_char = sql[after_pos:after_pos + 1] -%}
         {%- set next_ok = next_char == '' or not (next_char.isalnum() or next_char == '_') -%}
         {%- if prev_ok and next_ok -%}
-          {%- set ns.i = after_pos -%}
-          {#- Skip whitespace to find the ( -#}
-          {%- set ws = namespace(done=false) -%}
-          {%- for _ in range(n - ns.i) -%}
-            {%- if not ws.done and ns.i < n -%}
-              {%- if sql[ns.i] in [' ', '\t', '\n', '\r'] -%}
-                {%- set ns.i = ns.i + 1 -%}
-              {%- else -%}
-                {%- set ws.done = true -%}
-              {%- endif -%}
-            {%- endif -%}
-          {%- endfor -%}
-          {%- if ns.i < n and sql[ns.i] == '(' -%}
-            {%- set ns.open_idx = ns.i -%}
-            {%- set ns.i = ns.i + 1 -%}
-            {#- Walk to the matching ) tracking depth from 1 -#}
-            {%- set depth_inner = namespace(d=1, done=false) -%}
-            {%- for _ in range(n - ns.i) -%}
-              {%- if not depth_inner.done and ns.i < n -%}
-                {%- set ic = sql[ns.i] -%}
+          {%- set ws_match = modules.re.match('[\\s]*\\(', sql[after_pos:]) -%}
+          {%- if ws_match -%}
+            {%- set open_idx = after_pos + (ws_match.group(0) | length) - 1 -%}
+            {%- set ns.open_idx = open_idx -%}
+            {%- set inner = namespace(depth=1, skip_until=0) -%}
+            {%- for ic in sql[open_idx + 1:] -%}
+              {%- set j = open_idx + 1 + loop.index0 -%}
+              {%- if j >= inner.skip_until and inner.depth > 0 -%}
                 {%- if ic == "'" -%}
-                  {%- set ns.i = ns.i + 1 -%}
-                  {%- set qi = namespace(done=false) -%}
-                  {%- for _ in range(n - ns.i) -%}
-                    {%- if not qi.done and ns.i < n -%}
-                      {%- if sql[ns.i] == "'" -%}
-                        {%- if sql[ns.i + 1:ns.i + 2] == "'" -%}
-                          {%- set ns.i = ns.i + 2 -%}
-                        {%- else -%}
-                          {%- set ns.i = ns.i + 1 -%}
-                          {%- set qi.done = true -%}
-                        {%- endif -%}
-                      {%- else -%}
-                        {%- set ns.i = ns.i + 1 -%}
-                      {%- endif -%}
-                    {%- endif -%}
-                  {%- endfor -%}
-                {%- elif ic == '$' and sql[ns.i + 1:ns.i + 2] == '$' -%}
-                  {%- set ns.i = ns.i + 2 -%}
-                  {%- set qi = namespace(done=false) -%}
-                  {%- for _ in range(n - ns.i) -%}
-                    {%- if not qi.done and ns.i < n -%}
-                      {%- if sql[ns.i] == '$' and sql[ns.i + 1:ns.i + 2] == '$' -%}
-                        {%- set ns.i = ns.i + 2 -%}
-                        {%- set qi.done = true -%}
-                      {%- else -%}
-                        {%- set ns.i = ns.i + 1 -%}
-                      {%- endif -%}
-                    {%- endif -%}
-                  {%- endfor -%}
+                  {%- set end_q = modules.re.search("(?:[^']|'')*'", sql[j + 1:]) -%}
+                  {%- set inner.skip_until = (j + 1 + end_q.end()) if end_q else (sql | length) -%}
+                {%- elif ic == '$' and sql[j + 1:j + 2] == '$' -%}
+                  {%- set end_dq = sql.find('$$', j + 2) -%}
+                  {%- set inner.skip_until = (end_dq + 2) if end_dq != -1 else (sql | length) -%}
                 {%- elif ic == '(' -%}
-                  {%- set depth_inner.d = depth_inner.d + 1 -%}
-                  {%- set ns.i = ns.i + 1 -%}
+                  {%- set inner.depth = inner.depth + 1 -%}
                 {%- elif ic == ')' -%}
-                  {%- set depth_inner.d = depth_inner.d - 1 -%}
-                  {%- if depth_inner.d == 0 -%}
-                    {%- set ns.close_idx = ns.i -%}
+                  {%- set inner.depth = inner.depth - 1 -%}
+                  {%- if inner.depth == 0 -%}
+                    {%- set ns.close_idx = j -%}
                     {%- set ns.found = true -%}
-                    {%- set depth_inner.done = true -%}
                   {%- endif -%}
-                  {%- set ns.i = ns.i + 1 -%}
-                {%- else -%}
-                  {%- set ns.i = ns.i + 1 -%}
                 {%- endif -%}
               {%- endif -%}
             {%- endfor -%}
-          {%- else -%}
-            {%- set ns.i = ns.i + 1 -%}
+            {%- if ns.found -%}
+              {%- set ns.skip_until = sql | length -%}
+            {%- endif -%}
           {%- endif -%}
-        {%- else -%}
-          {%- set ns.i = ns.i + 1 -%}
         {%- endif -%}
 
-      {%- else -%}
-        {%- set ns.i = ns.i + 1 -%}
       {%- endif -%}
     {%- endif -%}
   {%- endfor -%}
@@ -256,79 +191,37 @@
 
   Splits `body` on commas at paren depth 0, outside '...' and $$...$$
   regions. Returns a list of entry strings.
+
+  Uses direct string iteration (for ch in body) instead of range(n) to
+  avoid Jinja's MAX_RANGE sandbox limit on large clause bodies.
+  Tracks entry start position and slices body[start:i] at each depth-0 comma.
 -#}
 {% macro _sv_split_depth0(body) -%}
-  {%- set n = body | length -%}
-  {%- set ns = namespace(i=0, depth=0, current='') -%}
+  {%- set ns = namespace(depth=0, start=0, skip_until=0) -%}
   {%- set entries = [] -%}
 
-  {%- for _ in range(n) -%}
-    {%- if ns.i < n -%}
-      {%- set ch = body[ns.i] -%}
-
+  {%- for ch in body -%}
+    {%- set i = loop.index0 -%}
+    {%- if i >= ns.skip_until -%}
       {%- if ch == "'" -%}
-        {%- set ns.current = ns.current ~ ch -%}
-        {%- set ns.i = ns.i + 1 -%}
-        {%- set inner = namespace(done=false) -%}
-        {%- for _ in range(n - ns.i) -%}
-          {%- if not inner.done and ns.i < n -%}
-            {%- if body[ns.i] == "'" -%}
-              {%- if body[ns.i + 1:ns.i + 2] == "'" -%}
-                {%- set ns.current = ns.current ~ "''" -%}
-                {%- set ns.i = ns.i + 2 -%}
-              {%- else -%}
-                {%- set ns.current = ns.current ~ "'" -%}
-                {%- set ns.i = ns.i + 1 -%}
-                {%- set inner.done = true -%}
-              {%- endif -%}
-            {%- else -%}
-              {%- set ns.current = ns.current ~ body[ns.i] -%}
-              {%- set ns.i = ns.i + 1 -%}
-            {%- endif -%}
-          {%- endif -%}
-        {%- endfor -%}
-
-      {%- elif ch == '$' and body[ns.i + 1:ns.i + 2] == '$' -%}
-        {%- set ns.current = ns.current ~ '$$' -%}
-        {%- set ns.i = ns.i + 2 -%}
-        {%- set inner = namespace(done=false) -%}
-        {%- for _ in range(n - ns.i) -%}
-          {%- if not inner.done and ns.i < n -%}
-            {%- if body[ns.i] == '$' and body[ns.i + 1:ns.i + 2] == '$' -%}
-              {%- set ns.current = ns.current ~ '$$' -%}
-              {%- set ns.i = ns.i + 2 -%}
-              {%- set inner.done = true -%}
-            {%- else -%}
-              {%- set ns.current = ns.current ~ body[ns.i] -%}
-              {%- set ns.i = ns.i + 1 -%}
-            {%- endif -%}
-          {%- endif -%}
-        {%- endfor -%}
-
+        {%- set end_q = modules.re.search("(?:[^']|'')*'", body[i + 1:]) -%}
+        {%- set ns.skip_until = (i + 1 + end_q.end()) if end_q else (body | length) -%}
+      {%- elif ch == '$' and body[i + 1:i + 2] == '$' -%}
+        {%- set end_dq = body.find('$$', i + 2) -%}
+        {%- set ns.skip_until = (end_dq + 2) if end_dq != -1 else (body | length) -%}
       {%- elif ch == '(' -%}
         {%- set ns.depth = ns.depth + 1 -%}
-        {%- set ns.current = ns.current ~ ch -%}
-        {%- set ns.i = ns.i + 1 -%}
-
       {%- elif ch == ')' -%}
         {%- set ns.depth = ns.depth - 1 -%}
-        {%- set ns.current = ns.current ~ ch -%}
-        {%- set ns.i = ns.i + 1 -%}
-
       {%- elif ch == ',' and ns.depth == 0 -%}
-        {%- do entries.append(ns.current) -%}
-        {%- set ns.current = '' -%}
-        {%- set ns.i = ns.i + 1 -%}
-
-      {%- else -%}
-        {%- set ns.current = ns.current ~ ch -%}
-        {%- set ns.i = ns.i + 1 -%}
+        {%- do entries.append(body[ns.start:i]) -%}
+        {%- set ns.start = i + 1 -%}
       {%- endif -%}
     {%- endif -%}
   {%- endfor -%}
 
-  {%- if ns.current | trim | length > 0 -%}
-    {%- do entries.append(ns.current) -%}
+  {%- if body[ns.start:] | trim | length > 0 -%}
+    {%- do entries.append(body[ns.start:]) -%}
   {%- endif -%}
 
   {%- do return(entries) -%}
